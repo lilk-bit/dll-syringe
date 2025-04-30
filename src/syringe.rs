@@ -139,14 +139,17 @@ impl Syringe {
         })?;
 
         let module_path = payload_path.as_ref().absolutize()?;
-        let wide_module_path =
-            U16CString::from_os_str(module_path.as_os_str())?.into_vec_with_nul();
-        let remote_wide_module_path = self
+        // let wide_module_path =
+            // U16CString::from_os_str(module_path.as_os_str())?.into_vec_with_nul();
+        let remote_module_path = self
             .remote_allocator
-            .alloc_and_copy_buf(wide_module_path.as_slice())?;
+            .alloc_and_copy_buf(module_path.as_slice())?;
+        // let remote_wide_module_path = self
+            // .remote_allocator
+            // .alloc_and_copy_buf(wide_module_path.as_slice())?;
 
         let injected_module_handle = load_library_w
-            .call(remote_wide_module_path.as_raw_ptr().cast())
+            .call(remote_module_path.as_raw_ptr().cast())
             .map_err(|e| match e {
                 InjectError::RemoteIo(io) if io.raw_os_error() == Some(193) => {
                     InjectError::ArchitectureMismatch
@@ -206,212 +209,6 @@ impl Syringe {
         }
 
         let exit_code = self.process().run_remote_thread(
-            unsafe { mem::transmute(inject_data.get_free_library_fn_ptr()) },
-            module.handle(),
-        )?;
-
-        let free_library_result = exit_code as BOOL;
-
-        if free_library_result == FALSE {
-            return Err(EjectError::RemoteIo(io::Error::new(
-                io::ErrorKind::Other,
-                "failed to eject module from process",
-            )));
-        }
-        if let Ok(exception) = ExceptionCode::try_from_primitive(exit_code) {
-            return Err(EjectError::RemoteException(exception));
-        }
-
-        debug_assert!(
-            !self
-                .remote_allocator
-                .process()
-                .module_handles()?
-                .any(|m| m == module.handle()),
-            "ejected module survived"
-        );
-
-        Ok(())
-    }
-
-    pub(crate) fn load_inject_help_data_for_process(
-        process: BorrowedProcess<'_>,
-    ) -> Result<InjectHelpData, LoadInjectHelpDataError> {
-        let is_target_x64 = process.is_x64()?;
-        let is_self_x64 = cfg!(target_arch = "x86_64");
-
-        match (is_target_x64, is_self_x64) {
-            (true, true) | (false, false) => Self::load_inject_help_data_for_current_target(),
-            #[cfg(all(target_arch = "x86_64", feature = "into-x86-from-x64"))]
-            (false, true) => Self::_load_inject_help_data_for_process(process),
-            _ => Err(LoadInjectHelpDataError::UnsupportedTarget),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn remote_exit_code_to_exception(exit_code: u32) -> Result<u32, ExceptionCode> {
-        if exit_code == 0 {
-            return Ok(exit_code);
-        }
-
-        match ExceptionCode::try_from_primitive(exit_code) {
-            Ok(exception) => Err(exception),
-            Err(_) => Ok(exit_code),
-        }
-    }
-
-    pub(crate) fn remote_exit_code_to_error_or_exception(
-        exit_code: u32,
-    ) -> Result<(), ExceptionOrIoError> {
-        if exit_code == 0 {
-            return Ok(());
-        }
-
-        match ExceptionCode::try_from_primitive(exit_code) {
-            Ok(exception) => Err(ExceptionOrIoError::Exception(exception)),
-            Err(_) => Err(ExceptionOrIoError::Io(io::Error::from_raw_os_error(
-                exit_code as _,
-            ))),
-        }
-    }
-
-    fn load_inject_help_data_for_current_target() -> Result<InjectHelpData, LoadInjectHelpDataError>
-    {
-        let kernel32_module =
-            BorrowedProcessModule::find_local_by_name_or_abs_path_wstr(u16cstr!("kernel32.dll"))?
-                .unwrap();
-
-        let load_library_fn_ptr =
-            kernel32_module.get_local_procedure_address_cstr(cstr!("LoadLibraryW"))?;
-        let free_library_fn_ptr =
-            kernel32_module.get_local_procedure_address_cstr(cstr!("FreeLibrary"))?;
-        let get_last_error_fn_ptr =
-            kernel32_module.get_local_procedure_address_cstr(cstr!("GetLastError"))?;
-        #[cfg(feature = "rpc-core")]
-        let get_proc_address_fn_ptr =
-            kernel32_module.get_local_procedure_address_cstr(cstr!("GetProcAddress"))?;
-
-        Ok(InjectHelpData {
-            kernel32_module: kernel32_module.handle(),
-            load_library_offset: load_library_fn_ptr as usize - kernel32_module.handle() as usize,
-            free_library_offset: free_library_fn_ptr as usize - kernel32_module.handle() as usize,
-            get_last_error_offset: get_last_error_fn_ptr as usize
-                - kernel32_module.handle() as usize,
-            #[cfg(feature = "rpc-core")]
-            get_proc_address_offset: get_proc_address_fn_ptr as usize
-                - kernel32_module.handle() as usize,
-        })
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[cfg(feature = "into-x86-from-x64")]
-    fn _load_inject_help_data_for_process(
-        process: BorrowedProcess<'_>,
-    ) -> Result<InjectHelpData, LoadInjectHelpDataError> {
-        // get kernel32 handle of target process (may fail if target process is currently starting and has not loaded kernel32 yet)
-        let kernel32_module = process
-            .wait_for_module_by_name("kernel32.dll", Duration::from_secs(1))?
-            .unwrap();
-
-        // get path of kernel32 used in target process
-        let kernel32_path = if process.is_x86()? {
-            // We need to manually construct the path to the kernel32.dll used in WOW64 processes.
-            let mut wow64_path = Self::wow64_dir()?;
-            wow64_path.push("kernel32.dll");
-            wow64_path
-        } else {
-            kernel32_module.path()?
-        };
-
-        // load the dll as a pe and extract the fn offsets
-        let module_file_buffer = fs::read(kernel32_path)?;
-        let pe = PE::parse(&module_file_buffer)?;
-        let load_library_export = pe
-            .exports
-            .iter()
-            .find(|export| matches!(export.name, Some("LoadLibraryW")))
-            .unwrap();
-
-        let free_library_export = pe
-            .exports
-            .iter()
-            .find(|export| matches!(export.name, Some("FreeLibrary")))
-            .unwrap();
-
-        let get_last_error_export = pe
-            .exports
-            .iter()
-            .find(|export| matches!(export.name, Some("GetLastError")))
-            .unwrap();
-
-        #[cfg(feature = "rpc-core")]
-        let get_proc_address_export = pe
-            .exports
-            .iter()
-            .find(|export| matches!(export.name, Some("GetProcAddress")))
-            .unwrap();
-
-        Ok(InjectHelpData {
-            kernel32_module: kernel32_module.handle(),
-            load_library_offset: load_library_export.rva,
-            free_library_offset: free_library_export.rva,
-            get_last_error_offset: get_last_error_export.rva,
-            #[cfg(feature = "rpc-core")]
-            get_proc_address_offset: get_proc_address_export.rva,
-        })
-    }
-
-    #[cfg(all(target_arch = "x86_64", feature = "into-x86-from-x64"))]
-    fn wow64_dir() -> Result<PathBuf, io::Error> {
-        let mut path_buf = MaybeUninit::uninit_array::<MAX_PATH>();
-        let path_buf_len: u32 = path_buf.len().try_into().unwrap();
-        let result = unsafe { GetSystemWow64DirectoryW(path_buf[0].as_mut_ptr(), path_buf_len) };
-        if result == 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let path_len = result as usize;
-        let path = unsafe { MaybeUninit::slice_assume_init_ref(&path_buf[..path_len]) };
-        Ok(PathBuf::from(U16Str::from_slice(path).to_os_string()))
-    }
-}
-
-#[derive(Debug)]
-struct LoadLibraryWStub {
-    code: RemoteAllocation,
-    result: RemoteBox<ModuleHandle>,
-}
-
-impl LoadLibraryWStub {
-    fn build(
-        inject_data: &InjectHelpData,
-        remote_allocator: &RemoteBoxAllocator,
-    ) -> Result<Self, InjectError> {
-        let result = remote_allocator.alloc_uninit::<ModuleHandle>()?;
-
-        let code = if remote_allocator.process().is_x86()? {
-            Self::build_code_x86(
-                inject_data.get_load_library_fn_ptr(),
-                result.as_raw_ptr().cast(),
-                inject_data.get_get_last_error(),
-            )
-            .unwrap()
-        } else {
-            Self::build_code_x64(
-                inject_data.get_load_library_fn_ptr(),
-                result.as_raw_ptr().cast(),
-                inject_data.get_get_last_error(),
-            )
-            .unwrap()
-        };
-        let code = remote_allocator.alloc_and_copy_buf(code.as_slice())?;
-
-        Ok(Self { code, result })
-    }
-
-    fn call(&self, remote_wide_module_path: *mut u16) -> Result<ModuleHandle, InjectError> {
-        // creating a thread that will call LoadLibraryW with a pointer to payload_path as argument
-        let exit_code = self.code.process().run_remote_thread(
             unsafe { mem::transmute(self.code.as_raw_ptr()) },
             remote_wide_module_path,
         )?;
